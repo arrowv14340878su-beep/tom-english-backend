@@ -4,6 +4,7 @@
   "description": "Tom English pronunciation evaluation backend",
   "main": "api/evaluate.js",
   "scripts": {
+    "start": "node api/evaluate.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "dependencies": {
