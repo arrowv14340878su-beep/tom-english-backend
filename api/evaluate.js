@@ -53,20 +53,12 @@ app.listen(PORT, () => {
 });
 
 // ============================================================
-// 讯飞 ISE v2 — 严格按照官方文档示例
+// 讯飞 ISE v2 — 按官方文档 + 官方 Java Demo
 //
-// 第1步 参数帧:
-//   { common: {app_id}, business: {cmd:"ssb", ...全部参数}, data: {status:0} }
-//   注意：data 里只有 status，没有 data/encoding/data_type
-//
-// 第2步 音频首帧:
-//   { business: {cmd:"auw", aus:1}, data: {status:1, data:"base64音频"} }
-//
-// 第3步 音频中间帧:
-//   { business: {cmd:"auw", aus:2}, data: {status:1, data:"base64音频"} }
-//
-// 第4步 音频尾帧:
-//   { business: {cmd:"auw", aus:4}, data: {status:2, data:"base64音频"} }
+// text 格式关键点（这是 48195 的根因）：
+//   英文 read_word: "\uFEFF[word]\napple"
+//   英文 read_sentence: "\uFEFF[content]\nThe cat sat on the mat."
+//   text 字段传 UTF-8 明文（带 BOM 头 + [word] 标签）
 // ============================================================
 function evaluateAudio(audioBase64, text) {
     return new Promise((resolve, reject) => {
@@ -89,15 +81,19 @@ function evaluateAudio(audioBase64, text) {
         let offset = 0;
         let frameCount = 0;
 
+        // 关键：构造正确的评测文本格式
+        // read_word 题型需要 [word] 标签包裹
+        const iseText = '\uFEFF[word]\n' + text;
+
         console.log(`[Tom] 音频=${audioBuffer.length}B 帧数=${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
+        console.log(`[Tom] 评测文本: "${iseText.replace('\uFEFF', 'BOM+')}"`);
 
         timeoutTimer = setTimeout(() => { done(new Error('超时(30s)')); }, 30000);
 
         ws.on('open', () => {
             console.log('[Tom] WS连接成功');
 
-            // ===== 第1步：参数帧 (cmd=ssb) =====
-            // 严格按官方示例：data 只有 {status: 0}，不含 data 字段
+            // ===== 第1步：参数帧 =====
             const paramFrame = {
                 common: {
                     app_id: XFYUN_CONFIG.APPID
@@ -110,7 +106,7 @@ function evaluateAudio(audioBase64, text) {
                     auf: 'audio/L16;rate=16000',
                     aue: 'raw',
                     tte: 'utf-8',
-                    text: '\uFEFF' + text,
+                    text: iseText,
                     ttp_skip: true
                 },
                 data: {
@@ -119,55 +115,51 @@ function evaluateAudio(audioBase64, text) {
             };
 
             ws.send(JSON.stringify(paramFrame));
-            console.log('[Tom] 参数帧已发送 (cmd=ssb, status=0)');
+            console.log('[Tom] 参数帧已发送 (cmd=ssb)');
 
             // ===== 第2-4步：音频帧 =====
-            const sendAudioFrame = () => {
+            const sendAudio = () => {
                 if (finished) return;
                 if (ws.readyState !== WebSocket.OPEN) return;
                 if (ws.bufferedAmount > MAX_BUFFERED) {
-                    setTimeout(sendAudioFrame, 10);
+                    setTimeout(sendAudio, 10);
                     return;
                 }
 
                 const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
                 const chunk = audioBuffer.slice(offset, end);
-                const isFirstAudio = (offset === 0);
-                const isLastAudio  = (end >= audioBuffer.length);
+                const isFirst = (offset === 0);
+                const isLast  = (end >= audioBuffer.length);
 
-                // aus: 1=首帧, 2=中间帧, 4=尾帧
                 let aus;
-                if (isFirstAudio) aus = 1;
-                else if (isLastAudio) aus = 4;
+                if (isFirst) aus = 1;
+                else if (isLast) aus = 4;
                 else aus = 2;
 
-                const audioFrame = {
+                const frame = {
                     business: {
                         cmd: 'auw',
                         aus: aus
                     },
                     data: {
-                        status: isLastAudio ? 2 : 1,
+                        status: isLast ? 2 : 1,
                         data: chunk.toString('base64')
                     }
                 };
 
-                ws.send(JSON.stringify(audioFrame));
+                ws.send(JSON.stringify(frame));
                 offset = end;
                 frameCount++;
 
-                if (isFirstAudio) {
-                    console.log('[Tom] 音频首帧 (aus=1, status=1)');
-                }
-                if (isLastAudio) {
-                    console.log(`[Tom] 音频尾帧 (aus=4, status=2), 共${frameCount}帧`);
+                if (isFirst) console.log('[Tom] 音频首帧 (aus=1)');
+                if (isLast) {
+                    console.log(`[Tom] 音频尾帧 (aus=4), 共${frameCount}帧`);
                 } else {
-                    setTimeout(sendAudioFrame, 40);
+                    setTimeout(sendAudio, 40);
                 }
             };
 
-            // 参数帧发完等40ms再发音频
-            setTimeout(sendAudioFrame, 40);
+            setTimeout(sendAudio, 40);
         });
 
         ws.on('message', (rawData) => {
@@ -176,54 +168,50 @@ function evaluateAudio(audioBase64, text) {
                 const resp = JSON.parse(rawData);
 
                 if (resp.code !== 0) {
-                    console.error(`[Tom] 讯飞错误: code=${resp.code} msg=${resp.message} sid=${resp.sid || ''}`);
+                    console.error(`[Tom] 讯飞错误: code=${resp.code} msg=${resp.message}`);
                     done(new Error(`讯飞错误(${resp.code}): ${resp.message}`));
                     return;
                 }
 
                 const ds = resp.data ? resp.data.status : '?';
-                console.log(`[Tom] 消息: code=0 data.status=${ds} sid=${resp.sid || ''}`);
+                console.log(`[Tom] 消息: code=0 status=${ds}`);
 
                 if (timeoutTimer) {
                     clearTimeout(timeoutTimer);
-                    timeoutTimer = setTimeout(() => { done(new Error('超时(等结果30s)')); }, 30000);
+                    timeoutTimer = setTimeout(() => { done(new Error('超时')); }, 30000);
                 }
 
                 if (resp.data && resp.data.status === 2) {
-                    const raw = resp.data.data;
                     let resultStr;
-
-                    // 尝试 base64 解码，如果失败则直接用原文
                     try {
-                        resultStr = Buffer.from(raw, 'base64').toString('utf-8');
+                        resultStr = Buffer.from(resp.data.data, 'base64').toString('utf-8');
                     } catch (_) {
-                        resultStr = raw;
+                        resultStr = resp.data.data;
                     }
-                    console.log('[Tom] 结果(前500):', resultStr.substring(0, 500));
+                    console.log('[Tom] 结果:', resultStr.substring(0, 500));
 
-                    // 结果可能是 XML 或 JSON
                     let score = 0;
-                    try {
-                        // 尝试 JSON 解析
-                        const resObj = JSON.parse(resultStr);
-                        const w = resObj.read_word;
-                        if (w && w.rec_paper && w.rec_paper.read_chapter) {
-                            const ch = w.rec_paper.read_chapter;
-                            if (ch.word && ch.word[0] && ch.word[0].total_score != null) {
-                                score = ch.word[0].total_score;
-                            } else if (ch.total_score != null) {
-                                score = ch.total_score;
+                    // 尝试 XML: <total_score value="85.3"/>
+                    const xmlMatch = resultStr.match(/total_score\s+value="([\d.]+)"/);
+                    if (xmlMatch) {
+                        score = parseFloat(xmlMatch[1]);
+                    } else {
+                        // 尝试 JSON
+                        try {
+                            const obj = JSON.parse(resultStr);
+                            const w = obj.read_word;
+                            if (w && w.rec_paper) {
+                                const ch = w.rec_paper.read_chapter;
+                                if (ch && ch.word && ch.word[0]) {
+                                    score = ch.word[0].total_score || 0;
+                                } else if (ch && ch.total_score != null) {
+                                    score = ch.total_score;
+                                }
                             }
-                        } else if (w && w.rec_paper && w.rec_paper.total_score != null) {
-                            score = w.rec_paper.total_score;
-                        }
-                    } catch (_) {
-                        // 可能是 XML 格式，尝试正则提取 total_score
-                        const match = resultStr.match(/total_score\s*[=:]["']?([\d.]+)/);
-                        if (match) {
-                            score = parseFloat(match[1]);
-                        } else {
-                            console.log('[Tom] 无法从结果中提取分数');
+                        } catch (_) {
+                            // 再尝试其他 XML 格式
+                            const m2 = resultStr.match(/total_score[^>]*>([\d.]+)/);
+                            if (m2) score = parseFloat(m2[1]);
                         }
                     }
 
@@ -231,7 +219,7 @@ function evaluateAudio(audioBase64, text) {
                     done(null, { success: true, score: Math.round(score) });
                 }
             } catch (e) {
-                done(new Error('解析WS消息失败: ' + e.message));
+                done(new Error('解析失败: ' + e.message));
             }
         });
 
@@ -240,7 +228,7 @@ function evaluateAudio(audioBase64, text) {
             done(new Error('WS错误: ' + err.message));
         });
 
-        ws.on('close', (code, reason) => {
+        ws.on('close', (code) => {
             console.log(`[Tom] WS关闭 code=${code}`);
             done(new Error('WS关闭(' + code + ')'));
         });
