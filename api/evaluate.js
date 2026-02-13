@@ -15,9 +15,9 @@ const XFYUN_CONFIG = {
   URI: '/v2/open-ise'
 };
 
-// 签名逻辑：使用最稳健的拼接方式
 function getAuthUrl() {
   const date = new Date().toUTCString();
+  // 签名原串：注意 GET 后面有个空格，URI 后面有个空格
   const signatureOrigin = `host: ${XFYUN_CONFIG.HOST}\ndate: ${date}\nGET ${XFYUN_CONFIG.URI} HTTP/1.1`;
   const hmac = crypto.createHmac('sha256', XFYUN_CONFIG.API_SECRET);
   const signature = hmac.update(signatureOrigin).digest('base64');
@@ -29,16 +29,16 @@ function getAuthUrl() {
 app.post('/api/evaluate', async (req, res) => {
   try {
     const { audio, text } = req.body;
-    console.log(`[TomEnglish] 收到请求: ${text}, 长度: ${audio ? audio.length : 0}`);
+    console.log(`[TomEnglish] 单词: ${text}, 长度: ${audio.length}`);
     const result = await evaluateAudio(audio, text);
     res.json(result);
   } catch (error) {
-    console.error('[TomEnglish Final Error]', error.message);
+    console.error('[Final Error]', error.message);
     res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.get('/', (req, res) => res.send('Backend Debugging...'));
+app.get('/', (req, res) => res.send('Backend is Ready'));
 app.listen(process.env.PORT || 8080);
 
 function evaluateAudio(audioBase64, text) {
@@ -46,19 +46,10 @@ function evaluateAudio(audioBase64, text) {
     let finished = false;
     const ws = new WebSocket(getAuthUrl());
     const audioBuffer = Buffer.from(audioBase64, 'base64');
-    let offset = 0;
     const FRAME_SIZE = 1280;
-
-    const safeReject = (msg) => {
-      if (!finished) {
-        finished = true;
-        ws.terminate();
-        reject(new Error(msg));
-      }
-    };
+    let offset = 0;
 
     ws.on('open', () => {
-      console.log('[iFlytek] WS已开启，正在分片...');
       const sendNext = () => {
         if (ws.readyState !== WebSocket.OPEN) return;
         const chunk = audioBuffer.slice(offset, Math.min(offset + FRAME_SIZE, audioBuffer.length));
@@ -93,8 +84,9 @@ function evaluateAudio(audioBase64, text) {
     ws.on('message', (data) => {
       const resp = JSON.parse(data);
       if (resp.code !== 0) {
-        console.error('[iFlytek Error Code]', resp.code, resp.message);
-        safeReject(`讯飞报错(${resp.code}): ${resp.message}`);
+        finished = true;
+        ws.terminate();
+        reject(new Error(`讯飞报错(${resp.code}): ${resp.message}`));
       } else if (resp.data && resp.data.status === 2) {
         finished = true;
         const resObj = JSON.parse(Buffer.from(resp.data.data, 'base64').toString('utf-8'));
@@ -104,17 +96,8 @@ function evaluateAudio(audioBase64, text) {
       }
     });
 
-    // 这里是抓取“异常”真相的关键
-    ws.on('error', (err) => {
-      console.error('[iFlytek WS Detail Error]', err); // 重点看这里的打印内容！
-      safeReject(`WebSocket异常: ${err.message}`);
-    });
-
-    ws.on('close', (code, reason) => {
-      console.log(`[iFlytek WS Close] Code: ${code}, Reason: ${reason}`);
-      safeReject('连接意外关闭');
-    });
-
-    setTimeout(() => safeReject('评测超时'), 20000);
+    ws.on('error', (err) => { if(!finished) { finished=true; reject(err); } });
+    ws.on('close', () => { if(!finished) { finished=true; reject(new Error('WS已关闭')); } });
+    setTimeout(() => { if(!finished) { finished=true; ws.terminate(); reject(new Error('超时')); } }, 20000);
   });
 }
