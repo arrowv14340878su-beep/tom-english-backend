@@ -1,3 +1,4 @@
+
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const express = require('express');
@@ -50,72 +51,59 @@ function evaluateAudio(audioBase64, text) {
     let finalResult = null;
 
     ws.on('open', () => {
-      console.log('已连接讯飞，正在发送首帧参数包...');
+      console.log('已连接讯飞，开始分片发送...');
       
-      // 【关键】第一帧：Status 0，只发参数，不带音频 data
-      const firstFrame = {
-        common: { app_id: XFYUN_CONFIG.APPID },
-        business: {
-          category: 'read_word',
-          sub: 'ise',
-          ent: 'en_vip',
-          cmd: 'ssb',
-          auf: 'audio/L16;rate=16000',
-          aue: 'raw',
-          tte: 'utf-8',
-          text: Buffer.from('\uFEFF' + text).toString('base64'), // 带BOM的UTF8
-          ttp_skip: 0,
-          aus: 1
-        },
-        data: {
-          status: 0,
-          encoding: 'raw',
-          data_type: 1,
-          data: "" // 首帧数据留空
+      const FRAME_SIZE = 5000; // 每帧5KB
+      let offset = 0;
+
+      const sendNext = () => {
+        const isFirst = (offset === 0);
+        const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
+        const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
+        const chunk = audioBuffer.slice(offset, end);
+
+        const frame = {
+          data: {
+            status: isFirst ? 0 : (isLast ? 2 : 1),
+            encoding: 'raw',
+            data_type: 1,
+            data: chunk.toString('base64')
+          }
+        };
+
+        if (isFirst) {
+          frame.common = { app_id: XFYUN_CONFIG.APPID };
+          frame.business = {
+            category: 'read_word',
+            sub: 'ise',
+            ent: 'en_vip',
+            cmd: 'ssb',
+            auf: 'audio/L16;rate=16000',
+            aue: 'raw',
+            tte: 'utf-8',
+            text: Buffer.from('\uFEFF' + text).toString('base64'),
+            ttp_skip: true, // 【关键修复】必须是 true (布尔值)
+            aus: 1
+          };
+        }
+
+        if (ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(frame));
+        }
+
+        offset += FRAME_SIZE;
+        if (!isLast) {
+          setTimeout(sendNext, 40);
         }
       };
-      
-      ws.send(JSON.stringify(firstFrame));
 
-      // 【关键】稍微等一下再发送后续音频包，防止讯飞还没准备好
-      setTimeout(() => {
-        const FRAME_SIZE = 5000;
-        let offset = 0;
-
-        const timer = setInterval(() => {
-          if (ws.readyState !== WebSocket.OPEN) {
-            clearInterval(timer);
-            return;
-          }
-
-          const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
-          const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
-          const chunk = audioBuffer.slice(offset, end);
-
-          const audioFrame = {
-            data: {
-              status: isLast ? 2 : 1,
-              encoding: 'raw',
-              data_type: 1,
-              data: chunk.toString('base64')
-            }
-          };
-
-          ws.send(JSON.stringify(audioFrame));
-          offset += FRAME_SIZE;
-
-          if (isLast) {
-            console.log('音频发送完毕');
-            clearInterval(timer);
-          }
-        }, 40);
-      }, 100); 
+      sendNext();
     });
 
     ws.on('message', (data) => {
       const resp = JSON.parse(data);
       if (resp.code !== 0) {
-        console.error('讯飞业务拒绝:', resp.message, '码:', resp.code);
+        console.error('讯飞报错:', resp.message);
         ws.close();
         return reject(new Error(`AI错误(${resp.code}): ${resp.message}`));
       }
@@ -128,8 +116,8 @@ function evaluateAudio(audioBase64, text) {
     });
 
     ws.on('error', (err) => reject(new Error('网络连接异常')));
-    ws.on('close', () => { if (!finalResult) reject(new Error('未收到AI评分结果')); });
-    setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.close(); }, 25000);
+    ws.on('close', () => { if (!finalResult) reject(new Error('未收到结果连接断开')); });
+    setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.close(); }, 20000);
   });
 }
 
@@ -137,6 +125,7 @@ function parseResult(data) {
   try {
     const resStr = Buffer.from(data.data, 'base64').toString('utf-8');
     const resObj = JSON.parse(resStr);
+    // 兼容讯飞ISE v2 JSON返回结构
     const word = resObj.read_word?.rec_paper?.read_chapter?.word?.[0] || {};
     return {
       success: true,
