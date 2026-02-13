@@ -1,4 +1,3 @@
-
 const crypto = require('crypto');
 const WebSocket = require('ws');
 const express = require('express');
@@ -30,16 +29,16 @@ app.post('/api/evaluate', async (req, res) => {
   try {
     const { audio, text } = req.body;
     if (!audio || !text) return res.status(400).json({ success: false, error: '参数缺失' });
-    console.log(`[收到请求] 单词: ${text}, 长度: ${audio.length}`);
+    console.log(`[请求] 单词: ${text}, 长度: ${audio.length}`);
     const result = await evaluateAudio(audio, text);
     return res.status(200).json(result);
   } catch (error) {
-    console.error('[错误日志]', error.message);
+    console.error('[异常]', error.message);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.get('/', (req, res) => res.send('Tom English Backend is Ready'));
+app.get('/', (req, res) => res.send('Tom English Backend Online'));
 const port = process.env.PORT || 8080;
 app.listen(port, "0.0.0.0");
 
@@ -51,27 +50,21 @@ function evaluateAudio(audioBase64, text) {
     let finalResult = null;
 
     ws.on('open', () => {
-      console.log('已连接讯飞，开始分片发送...');
+      console.log('WS连接成功，开始传输...');
       
-      const FRAME_SIZE = 5000; // 每帧5KB
+      const FRAME_SIZE = 5000;
       let offset = 0;
 
-      const sendNext = () => {
+      const sendFrame = () => {
         const isFirst = (offset === 0);
         const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
-        const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
-        const chunk = audioBuffer.slice(offset, end);
+        const chunk = audioBuffer.slice(offset, Math.min(offset + FRAME_SIZE, audioBuffer.length));
 
-        const frame = {
-          data: {
-            status: isFirst ? 0 : (isLast ? 2 : 1),
-            encoding: 'raw',
-            data_type: 1,
-            data: chunk.toString('base64')
-          }
-        };
+        // 构造满足讯飞V2严苛要求的JSON结构
+        const frame = {};
 
         if (isFirst) {
+          // 第一帧必须包含 common 和 business
           frame.common = { app_id: XFYUN_CONFIG.APPID };
           frame.business = {
             category: 'read_word',
@@ -81,11 +74,20 @@ function evaluateAudio(audioBase64, text) {
             auf: 'audio/L16;rate=16000',
             aue: 'raw',
             tte: 'utf-8',
-            text: Buffer.from('\uFEFF' + text).toString('base64'),
-            ttp_skip: true, // 【关键修复】必须是 true (布尔值)
+            rst: 'json', // 强制要求返回JSON
+            text: Buffer.from(text).toString('base64'), // 尝试不加BOM头
+            ttp_skip: true,
             aus: 1
           };
         }
+
+        // 每一帧都要有 data 块
+        frame.data = {
+          status: isFirst ? 0 : (isLast ? 2 : 1),
+          encoding: 'raw',
+          data_type: 1,
+          data: chunk.toString('base64')
+        };
 
         if (ws.readyState === WebSocket.OPEN) {
           ws.send(JSON.stringify(frame));
@@ -93,17 +95,17 @@ function evaluateAudio(audioBase64, text) {
 
         offset += FRAME_SIZE;
         if (!isLast) {
-          setTimeout(sendNext, 40);
+          setTimeout(sendFrame, 40);
         }
       };
 
-      sendNext();
+      sendFrame();
     });
 
     ws.on('message', (data) => {
       const resp = JSON.parse(data);
       if (resp.code !== 0) {
-        console.error('讯飞报错:', resp.message);
+        console.error(`讯飞拒接: [${resp.code}] ${resp.message}`);
         ws.close();
         return reject(new Error(`AI错误(${resp.code}): ${resp.message}`));
       }
@@ -115,8 +117,8 @@ function evaluateAudio(audioBase64, text) {
       }
     });
 
-    ws.on('error', (err) => reject(new Error('网络连接异常')));
-    ws.on('close', () => { if (!finalResult) reject(new Error('未收到结果连接断开')); });
+    ws.on('error', (err) => reject(new Error('WS连接异常')));
+    ws.on('close', () => { if (!finalResult) reject(new Error('未收到评测结果，连接已关闭')); });
     setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.close(); }, 20000);
   });
 }
@@ -125,14 +127,19 @@ function parseResult(data) {
   try {
     const resStr = Buffer.from(data.data, 'base64').toString('utf-8');
     const resObj = JSON.parse(resStr);
-    // 兼容讯飞ISE v2 JSON返回结构
-    const word = resObj.read_word?.rec_paper?.read_chapter?.word?.[0] || {};
+    
+    // 讯飞ISE V2 JSON结构的解析逻辑
+    // 路径: xml_result -> read_word -> rec_paper -> read_chapter -> word[0]
+    const wordData = resObj.read_word?.rec_paper?.read_chapter?.word?.[0] || {};
+    
     return {
       success: true,
-      score: Math.round(word.total_score || 0),
-      accuracy: Math.round(word.accuracy_score || 0)
+      score: Math.round(wordData.total_score || 0),
+      accuracy: Math.round(wordData.accuracy_score || 0),
+      fluency: Math.round(wordData.fluency_score || 0)
     };
   } catch (e) {
-    return { success: false, error: '结果解析异常' };
+    console.error('结果解析失败:', e);
+    return { success: false, error: '解析AI结果失败' };
   }
 }
