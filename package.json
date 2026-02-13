@@ -1,0 +1,15 @@
+{
+  "name": "tom-english-backend",
+  "version": "1.0.0",
+  "description": "Tom English pronunciation evaluation backend",
+  "main": "api/evaluate.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "dependencies": {
+    "ws": "^8.14.2"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
