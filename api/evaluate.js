@@ -28,17 +28,17 @@ function getAuthUrl() {
 app.post('/api/evaluate', async (req, res) => {
   try {
     const { audio, text } = req.body;
-    if (!audio || !text) return res.status(400).json({ success: false, error: '缺少音频或文本' });
-    console.log(`[请求] 单词: ${text}, 长度: ${audio.length}`);
+    if (!audio || !text) return res.status(400).json({ success: false, error: '参数缺失' });
+    console.log(`[收到请求] 单词: ${text}, 长度: ${audio.length}`);
     const result = await evaluateAudio(audio, text);
     return res.status(200).json(result);
   } catch (error) {
-    console.error('[异常]', error.message);
+    console.error('[错误日志]', error.message);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.get('/', (req, res) => res.send('Backend ready!'));
+app.get('/', (req, res) => res.send('Tom English Backend is Ready'));
 const port = process.env.PORT || 8080;
 app.listen(port, "0.0.0.0");
 
@@ -50,62 +50,76 @@ function evaluateAudio(audioBase64, text) {
     let finalResult = null;
 
     ws.on('open', () => {
-      console.log('WS已连接，开始发送数据流...');
+      console.log('已连接讯飞，正在发送首帧参数包...');
       
-      const FRAME_SIZE = 5000; // 每帧5KB
-      let offset = 0;
-
-      // 核心改进：第一帧必须包含业务参数 + 第一段音频数据
-      const sendFrame = () => {
-        const isFirst = (offset === 0);
-        const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
-        const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
-        const chunk = audioBuffer.slice(offset, end);
-
-        const frame = {
-          data: {
-            status: isFirst ? 0 : (isLast ? 2 : 1),
-            encoding: 'raw',
-            data_type: 1,
-            data: chunk.toString('base64')
-          }
-        };
-
-        if (isFirst) {
-          frame.common = { app_id: XFYUN_CONFIG.APPID };
-          frame.business = {
-            category: 'read_word',
-            sub: 'ise',
-            ent: 'en_vip',
-            cmd: 'ssb',
-            auf: 'audio/L16;rate=16000',
-            aue: 'raw',
-            tte: 'utf-8', // 明确指定文本编码
-            text: Buffer.from('\uFEFF' + text).toString('base64'),
-            ttp_skip: true,
-            aus: 1
-          };
-        }
-
-        ws.send(JSON.stringify(frame));
-        offset += FRAME_SIZE;
-
-        if (!isLast) {
-          setTimeout(sendFrame, 40); // 间隔40ms发送下一帧
-        } else {
-          console.log('数据发送完毕');
+      // 【关键】第一帧：Status 0，只发参数，不带音频 data
+      const firstFrame = {
+        common: { app_id: XFYUN_CONFIG.APPID },
+        business: {
+          category: 'read_word',
+          sub: 'ise',
+          ent: 'en_vip',
+          cmd: 'ssb',
+          auf: 'audio/L16;rate=16000',
+          aue: 'raw',
+          tte: 'utf-8',
+          text: Buffer.from('\uFEFF' + text).toString('base64'), // 带BOM的UTF8
+          ttp_skip: 0,
+          aus: 1
+        },
+        data: {
+          status: 0,
+          encoding: 'raw',
+          data_type: 1,
+          data: "" // 首帧数据留空
         }
       };
+      
+      ws.send(JSON.stringify(firstFrame));
 
-      sendFrame();
+      // 【关键】稍微等一下再发送后续音频包，防止讯飞还没准备好
+      setTimeout(() => {
+        const FRAME_SIZE = 5000;
+        let offset = 0;
+
+        const timer = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN) {
+            clearInterval(timer);
+            return;
+          }
+
+          const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
+          const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
+          const chunk = audioBuffer.slice(offset, end);
+
+          const audioFrame = {
+            data: {
+              status: isLast ? 2 : 1,
+              encoding: 'raw',
+              data_type: 1,
+              data: chunk.toString('base64')
+            }
+          };
+
+          ws.send(JSON.stringify(audioFrame));
+          offset += FRAME_SIZE;
+
+          if (isLast) {
+            console.log('音频发送完毕');
+            clearInterval(timer);
+          }
+        }, 40);
+      }, 100); 
     });
 
     ws.on('message', (data) => {
       const resp = JSON.parse(data);
       if (resp.code !== 0) {
+        console.error('讯飞业务拒绝:', resp.message, '码:', resp.code);
         ws.close();
-        return reject(new Error(`讯飞(${resp.code}): ${resp.message}`));
+        return reject(new Error(`AI错误(${resp.code}): ${resp.message}`));
       }
+      
       if (resp.data && resp.data.status === 2) {
         finalResult = resp.data;
         ws.close();
@@ -113,9 +127,9 @@ function evaluateAudio(audioBase64, text) {
       }
     });
 
-    ws.on('error', (err) => reject(new Error('WS连接错误')));
-    ws.on('close', () => { if (!finalResult) reject(new Error('未收到结果连接已断开')); });
-    setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.close(); }, 30000);
+    ws.on('error', (err) => reject(new Error('网络连接异常')));
+    ws.on('close', () => { if (!finalResult) reject(new Error('未收到AI评分结果')); });
+    setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.close(); }, 25000);
   });
 }
 
@@ -130,6 +144,6 @@ function parseResult(data) {
       accuracy: Math.round(word.accuracy_score || 0)
     };
   } catch (e) {
-    return { success: false, error: '解析失败' };
+    return { success: false, error: '结果解析异常' };
   }
 }
