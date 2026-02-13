@@ -15,67 +15,60 @@ const XFYUN_CONFIG = {
   URI: '/v2/open-ise'
 };
 
+// 签名逻辑：使用最稳健的拼接方式
 function getAuthUrl() {
   const date = new Date().toUTCString();
-  // 签名原串：严格遵守讯飞握手协议
   const signatureOrigin = `host: ${XFYUN_CONFIG.HOST}\ndate: ${date}\nGET ${XFYUN_CONFIG.URI} HTTP/1.1`;
   const hmac = crypto.createHmac('sha256', XFYUN_CONFIG.API_SECRET);
   const signature = hmac.update(signatureOrigin).digest('base64');
-  const authorizationOrigin = `api_key="${XFYUN_CONFIG.API_KEY}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
-  const authorization = Buffer.from(authorizationOrigin).toString('base64');
+  const authOrigin = `api_key="${XFYUN_CONFIG.API_KEY}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
+  const authorization = Buffer.from(authOrigin).toString('base64');
   return `wss://${XFYUN_CONFIG.HOST}${XFYUN_CONFIG.URI}?authorization=${authorization}&date=${encodeURIComponent(date)}&host=${XFYUN_CONFIG.HOST}`;
 }
 
 app.post('/api/evaluate', async (req, res) => {
   try {
     const { audio, text } = req.body;
-    if (!audio || !text) return res.status(400).json({ success: false, error: '缺少数据' });
-    console.log(`[TomEnglish] 收到请求: ${text}, 长度: ${audio.length}`);
+    console.log(`[TomEnglish] 收到请求: ${text}, 长度: ${audio ? audio.length : 0}`);
     const result = await evaluateAudio(audio, text);
-    return res.status(200).json(result);
+    res.json(result);
   } catch (error) {
-    console.error('[TomEnglish Error]', error.message);
-    return res.status(500).json({ success: false, error: error.message });
+    console.error('[TomEnglish Final Error]', error.message);
+    res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.get('/', (req, res) => res.send('Backend is Debugging...'));
+app.get('/', (req, res) => res.send('Backend Debugging...'));
 app.listen(process.env.PORT || 8080);
 
 function evaluateAudio(audioBase64, text) {
   return new Promise((resolve, reject) => {
-    let resolvedOrRejected = false;
-    const authUrl = getAuthUrl();
-    const ws = new WebSocket(authUrl);
+    let finished = false;
+    const ws = new WebSocket(getAuthUrl());
     const audioBuffer = Buffer.from(audioBase64, 'base64');
-    
     let offset = 0;
     const FRAME_SIZE = 1280;
-    let finalResult = null;
 
-    // 定时器检查
-    const timeoutTimer = setTimeout(() => {
-      if (!resolvedOrRejected) {
-        resolvedOrRejected = true;
+    const safeReject = (msg) => {
+      if (!finished) {
+        finished = true;
         ws.terminate();
-        reject(new Error('讯飞连接超时'));
+        reject(new Error(msg));
       }
-    }, 15000);
+    };
 
     ws.on('open', () => {
-      console.log('[iFlytek] WS 连接已建立，开始传输...');
-      
+      console.log('[iFlytek] WS已开启，正在分片...');
       const sendNext = () => {
         if (ws.readyState !== WebSocket.OPEN) return;
-        const isFirst = (offset === 0);
         const chunk = audioBuffer.slice(offset, Math.min(offset + FRAME_SIZE, audioBuffer.length));
+        const isFirst = (offset === 0);
         const isLast = (offset + chunk.length >= audioBuffer.length);
         
         const frame = {
           data: {
             status: isFirst ? 0 : (isLast ? 2 : 1),
-            encoding: 'raw',
-            data_type: 1,
+            encoding: 'raw', data_type: 1,
             data: chunk.toString('base64')
           }
         };
@@ -83,14 +76,9 @@ function evaluateAudio(audioBase64, text) {
         if (isFirst) {
           frame.common = { app_id: XFYUN_CONFIG.APPID };
           frame.business = {
-            category: 'read_word',
-            sub: 'ise',
-            ent: 'en_vip',
-            cmd: 'ssb',
-            auf: 'audio/L16;rate=16000',
-            aue: 'raw',
-            tte: 'utf-8',
-            text: Buffer.from('\uFEFF' + text).toString('base64'),
+            category: 'read_word', sub: 'ise', ent: 'en_vip', cmd: 'ssb',
+            auf: 'audio/L16;rate=16000', aue: 'raw', tte: 'utf-8',
+            text: Buffer.from('\ufeff' + text).toString('base64'),
             ttp_skip: true
           };
         }
@@ -105,49 +93,28 @@ function evaluateAudio(audioBase64, text) {
     ws.on('message', (data) => {
       const resp = JSON.parse(data);
       if (resp.code !== 0) {
-        console.error('[iFlytek Error Response]', JSON.stringify(resp));
-        if (!resolvedOrRejected) {
-          resolvedOrRejected = true;
-          ws.close();
-          reject(new Error(`讯飞报错(${resp.code}): ${resp.message}`));
-        }
+        console.error('[iFlytek Error Code]', resp.code, resp.message);
+        safeReject(`讯飞报错(${resp.code}): ${resp.message}`);
       } else if (resp.data && resp.data.status === 2) {
-        finalResult = resp.data;
-        if (!resolvedOrRejected) {
-          resolvedOrRejected = true;
-          clearTimeout(timeoutTimer);
-          ws.close();
-          resolve(parseResult(finalResult));
-        }
+        finished = true;
+        const resObj = JSON.parse(Buffer.from(resp.data.data, 'base64').toString('utf-8'));
+        const score = resObj.read_word?.rec_paper?.read_chapter?.word?.[0]?.total_score || 0;
+        ws.close();
+        resolve({ success: true, score: Math.round(score) });
       }
     });
 
+    // 这里是抓取“异常”真相的关键
     ws.on('error', (err) => {
-      console.error('[iFlytek WS Error Detail]', err); // 这里的详细日志非常重要！
-      if (!resolvedOrRejected) {
-        resolvedOrRejected = true;
-        clearTimeout(timeoutTimer);
-        reject(new Error(`WebSocket异常: ${err.message}`));
-      }
+      console.error('[iFlytek WS Detail Error]', err); // 重点看这里的打印内容！
+      safeReject(`WebSocket异常: ${err.message}`);
     });
 
     ws.on('close', (code, reason) => {
-      if (!resolvedOrRejected) {
-        resolvedOrRejected = true;
-        clearTimeout(timeoutTimer);
-        reject(new Error(`连接已关闭(Code:${code}, Reason:${reason})`));
-      }
+      console.log(`[iFlytek WS Close] Code: ${code}, Reason: ${reason}`);
+      safeReject('连接意外关闭');
     });
-  });
-}
 
-function parseResult(data) {
-  try {
-    const resStr = Buffer.from(data.data, 'base64').toString('utf-8');
-    const resObj = JSON.parse(resStr);
-    const word = resObj.read_word?.rec_paper?.read_chapter?.word?.[0] || {};
-    return { success: true, score: Math.round(word.total_score || 0) };
-  } catch (e) {
-    return { success: false, error: '解析结果失败' };
-  }
+    setTimeout(() => safeReject('评测超时'), 20000);
+  });
 }
