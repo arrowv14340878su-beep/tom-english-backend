@@ -70,54 +70,44 @@ app.listen(PORT, () => {
 // ============================================================
 function evaluateAudio(audioBase64, text) {
     return new Promise((resolve, reject) => {
-        // ---- 防重复触发 ----
         let finished = false;
         let timeoutTimer = null;
 
+        // 统一出口：防重复触发 + 清理资源
         const done = (err, result) => {
             if (finished) return;
             finished = true;
-
-            // 清超时定时器
-            if (timeoutTimer) {
-                clearTimeout(timeoutTimer);
-                timeoutTimer = null;
-            }
-
-            // 确保 ws 关闭
+            if (timeoutTimer) { clearTimeout(timeoutTimer); timeoutTimer = null; }
             try { ws.terminate(); } catch (_) {}
-
             if (err) reject(err);
             else resolve(result);
         };
 
-        // ---- 连接讯飞 ----
-        const authUrl = getAuthUrl();
-        const ws = new WebSocket(authUrl);
+        // 连接讯飞
+        const ws = new WebSocket(getAuthUrl());
         const audioBuffer = Buffer.from(audioBase64, 'base64');
 
-        // 优化：每帧 2560 bytes = 80ms @16kHz/16bit/mono，减少帧数
+        // 每帧 2560 bytes = 80ms @16kHz/16bit/mono，减少帧数
         const FRAME_SIZE = 2560;
-        // WebSocket 发送缓冲区上限
-        const MAX_BUFFERED = 1024 * 1024; // 1MB
+        const MAX_BUFFERED = 1024 * 1024; // 1MB 缓冲上限
         let offset = 0;
 
-        console.log(`[Tom] 音频总大小: ${audioBuffer.length}B, 预计帧数: ${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
+        console.log(`[Tom] 音频: ${audioBuffer.length}B, 帧数: ${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
 
-        // ---- 超时：30 秒 ----
+        // 30 秒总超时
         timeoutTimer = setTimeout(() => {
             done(new Error('评测超时(30s)'));
         }, 30000);
 
-        // ---- 发送逻辑（带流控） ----
+        // ---- 发送音频（带流控） ----
         ws.on('open', () => {
-            console.log('[Tom] WebSocket 已连接，开始发送音频');
+            console.log('[Tom] WS已连接，发送音频...');
 
             const sendNext = () => {
                 if (finished) return;
                 if (ws.readyState !== WebSocket.OPEN) return;
 
-                // 流控：如果 ws 缓冲区超过上限，等一等再发
+                // 流控
                 if (ws.bufferedAmount > MAX_BUFFERED) {
                     setTimeout(sendNext, 10);
                     return;
@@ -137,7 +127,6 @@ function evaluateAudio(audioBase64, text) {
                     }
                 };
 
-                // 第一帧带业务参数
                 if (isFirst) {
                     frame.common = { app_id: XFYUN_CONFIG.APPID };
                     frame.business = {
@@ -157,10 +146,9 @@ function evaluateAudio(audioBase64, text) {
                 offset = end;
 
                 if (!isLast) {
-                    // 每帧间隔 20ms（比 80ms 实时快，加速发送，靠 bufferedAmount 限流）
                     setTimeout(sendNext, 20);
                 } else {
-                    console.log('[Tom] 音频全部发送完毕，等待评测结果...');
+                    console.log('[Tom] 音频发送完毕，等待结果...');
                 }
             };
 
@@ -170,7 +158,6 @@ function evaluateAudio(audioBase64, text) {
         // ---- 接收结果 ----
         ws.on('message', (rawData) => {
             if (finished) return;
-
             try {
                 const resp = JSON.parse(rawData);
 
@@ -179,7 +166,7 @@ function evaluateAudio(audioBase64, text) {
                     return;
                 }
 
-                // 收到消息就刷新超时（防止评测期间被误杀）
+                // 收到消息就刷新超时
                 if (timeoutTimer) {
                     clearTimeout(timeoutTimer);
                     timeoutTimer = setTimeout(() => {
@@ -188,14 +175,11 @@ function evaluateAudio(audioBase64, text) {
                 }
 
                 if (resp.data && resp.data.status === 2) {
-                    // 最终结果
                     const resultStr = Buffer.from(resp.data.data, 'base64').toString('utf-8');
                     console.log('[Tom] 原始结果(前300):', resultStr.substring(0, 300));
 
                     try {
                         const resObj = JSON.parse(resultStr);
-
-                        // 多路径提取分数，兼容不同返回结构
                         let score = 0;
                         const word = resObj.read_word;
                         if (word?.rec_paper?.read_chapter?.word?.[0]?.total_score != null) {
@@ -205,8 +189,7 @@ function evaluateAudio(audioBase64, text) {
                         } else if (word?.rec_paper?.total_score != null) {
                             score = word.rec_paper.total_score;
                         }
-
-                        console.log(`[Tom] 提取得分: ${score}`);
+                        console.log(`[Tom] 得分: ${score}`);
                         done(null, { success: true, score: Math.round(score) });
                     } catch (parseErr) {
                         done(new Error('解析评测JSON失败: ' + parseErr.message));
@@ -217,10 +200,9 @@ function evaluateAudio(audioBase64, text) {
             }
         });
 
-        // ---- 错误 & 断开 ----
         ws.on('error', (err) => {
             console.error('[Tom] WS Error:', err.message);
-            done(new Error('WebSocket连接错误: ' + err.message));
+            done(new Error('WebSocket错误: ' + err.message));
         });
 
         ws.on('close', (code, reason) => {
