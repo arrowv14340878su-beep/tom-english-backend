@@ -53,14 +53,19 @@ app.listen(PORT, () => {
 });
 
 // ============================================================
-// 讯飞 ISE v2 协议（根据实际测试修正）：
+// 讯飞 ISE v2 官方协议（严格按文档）：
 //
-//   首帧：  common + business(完整参数, cmd="ssb") + data(status=0)
-//   中间帧：business(只含 cmd="auw")               + data(status=1)
-//   尾帧：  business(只含 cmd="aue")               + data(status=2)
+// 第1步 - 参数上传帧（不含音频数据）：
+//   { common, business(cmd="ssb", 全部参数), data(status=0, data为空字符串) }
 //
-// 首帧的 business 包含所有评测参数。
-// 后续帧的 business 只需要 cmd 字段指示当前阶段。
+// 第2步 - 音频首帧：
+//   { business(cmd="auw", aus=1), data(status=1, data=音频base64) }
+//
+// 第3步 - 音频中间帧（循环）：
+//   { business(cmd="auw", aus=2), data(status=1, data=音频base64) }
+//
+// 第4步 - 音频尾帧：
+//   { business(cmd="auw", aus=4), data(status=2, data=音频base64) }
 // ============================================================
 function evaluateAudio(audioBase64, text) {
     return new Promise((resolve, reject) => {
@@ -78,100 +83,98 @@ function evaluateAudio(audioBase64, text) {
 
         const ws = new WebSocket(getAuthUrl());
         const audioBuffer = Buffer.from(audioBase64, 'base64');
-        const FRAME_SIZE = 1280; // 40ms @16kHz/16bit
+        const FRAME_SIZE = 1280; // 40ms @16kHz/16bit，讯飞推荐值
         const MAX_BUFFERED = 1024 * 1024;
         let offset = 0;
         let frameCount = 0;
 
-        console.log(`[Tom] 音频=${audioBuffer.length}B 帧数=${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
+        const totalFrames = Math.ceil(audioBuffer.length / FRAME_SIZE);
+        console.log(`[Tom] 音频=${audioBuffer.length}B 音频帧数=${totalFrames}`);
 
         timeoutTimer = setTimeout(() => { done(new Error('超时(30s)')); }, 30000);
 
         ws.on('open', () => {
             console.log('[Tom] WS连接成功');
 
-            const sendNext = () => {
+            // ========== 第1步：发送参数帧（cmd=ssb, 不含音频） ==========
+            const paramFrame = {
+                common: {
+                    app_id: XFYUN_CONFIG.APPID
+                },
+                business: {
+                    category: 'read_word',
+                    sub: 'ise',
+                    ent: 'en_vip',
+                    cmd: 'ssb',
+                    auf: 'audio/L16;rate=16000',
+                    aue: 'raw',
+                    tte: 'utf-8',
+                    text: Buffer.from('\uFEFF' + text).toString('base64'),
+                    ttp_skip: true
+                },
+                data: {
+                    status: 0,
+                    encoding: 'raw',
+                    data_type: 1,
+                    data: ''
+                }
+            };
+            ws.send(JSON.stringify(paramFrame));
+            console.log('[Tom] 参数帧已发送 (cmd=ssb, status=0, 无音频)');
+
+            // ========== 第2-4步：发送音频帧 ==========
+            const sendAudioFrame = () => {
                 if (finished) return;
                 if (ws.readyState !== WebSocket.OPEN) return;
                 if (ws.bufferedAmount > MAX_BUFFERED) {
-                    setTimeout(sendNext, 10);
+                    setTimeout(sendAudioFrame, 10);
                     return;
                 }
 
                 const end = Math.min(offset + FRAME_SIZE, audioBuffer.length);
                 const chunk = audioBuffer.slice(offset, end);
-                const isFirst = (offset === 0);
-                const isLast  = (end >= audioBuffer.length);
+                const isFirstAudio = (offset === 0);
+                const isLastAudio  = (end >= audioBuffer.length);
 
-                let frame;
-
-                if (isFirst) {
-                    // ===== 首帧：完整参数 =====
-                    frame = {
-                        common: {
-                            app_id: XFYUN_CONFIG.APPID
-                        },
-                        business: {
-                            category: 'read_word',
-                            sub: 'ise',
-                            ent: 'en_vip',
-                            cmd: 'ssb',
-                            auf: 'audio/L16;rate=16000',
-                            aue: 'raw',
-                            tte: 'utf-8',
-                            text: Buffer.from('\uFEFF' + text).toString('base64'),
-                            ttp_skip: true
-                        },
-                        data: {
-                            status: 0,
-                            encoding: 'raw',
-                            data_type: 1,
-                            data: chunk.toString('base64')
-                        }
-                    };
-                } else if (isLast) {
-                    // ===== 尾帧：business 只含 cmd=aue =====
-                    frame = {
-                        business: {
-                            cmd: 'aue'
-                        },
-                        data: {
-                            status: 2,
-                            encoding: 'raw',
-                            data_type: 1,
-                            data: chunk.toString('base64')
-                        }
-                    };
+                // aus: 1=音频首帧, 2=中间帧, 4=尾帧
+                let aus;
+                if (isFirstAudio) {
+                    aus = 1;
+                } else if (isLastAudio) {
+                    aus = 4;
                 } else {
-                    // ===== 中间帧：business 只含 cmd=auw =====
-                    frame = {
-                        business: {
-                            cmd: 'auw'
-                        },
-                        data: {
-                            status: 1,
-                            encoding: 'raw',
-                            data_type: 1,
-                            data: chunk.toString('base64')
-                        }
-                    };
+                    aus = 2;
                 }
 
-                ws.send(JSON.stringify(frame));
+                const audioFrame = {
+                    business: {
+                        cmd: 'auw',
+                        aus: aus
+                    },
+                    data: {
+                        status: isLastAudio ? 2 : 1,
+                        encoding: 'raw',
+                        data_type: 1,
+                        data: chunk.toString('base64')
+                    }
+                };
+
+                ws.send(JSON.stringify(audioFrame));
                 offset = end;
                 frameCount++;
 
-                if (isFirst) {
-                    console.log('[Tom] 首帧已发送 (cmd=ssb, status=0)');
+                if (isFirstAudio) {
+                    console.log('[Tom] 音频首帧 (cmd=auw, aus=1, status=1)');
                 }
-                if (isLast) {
-                    console.log(`[Tom] 尾帧已发送 (cmd=aue, status=2), 共${frameCount}帧`);
+                if (isLastAudio) {
+                    console.log(`[Tom] 音频尾帧 (cmd=auw, aus=4, status=2), 共${frameCount}帧`);
                 } else {
-                    setTimeout(sendNext, 40);
+                    setTimeout(sendAudioFrame, 40);
                 }
             };
 
-            sendNext();
+            // 参数帧发送后，稍等一下再开始发音频
+            setTimeout(sendAudioFrame, 40);
         });
 
         ws.on('message', (rawData) => {
@@ -185,7 +188,8 @@ function evaluateAudio(audioBase64, text) {
                     return;
                 }
 
-                console.log(`[Tom] 消息: code=${resp.code} data.status=${resp.data && resp.data.status} sid=${resp.sid || ''}`);
+                const dataStatus = resp.data ? resp.data.status : 'N/A';
+                console.log(`[Tom] 消息: code=${resp.code} data.status=${dataStatus} sid=${resp.sid || ''}`);
 
                 // 刷新超时
                 if (timeoutTimer) {
