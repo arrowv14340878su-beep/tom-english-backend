@@ -7,9 +7,6 @@ const app = express();
 app.use(cors());
 app.use(express.json({ limit: '100mb' }));
 
-// ============================================================
-// 讯飞配置
-// ============================================================
 const XFYUN_CONFIG = {
     APPID:      (process.env.XFYUN_APPID      || '').trim(),
     API_SECRET: (process.env.XFYUN_API_SECRET  || '').trim(),
@@ -18,9 +15,6 @@ const XFYUN_CONFIG = {
     URI:  '/v2/open-ise'
 };
 
-// ============================================================
-// 签名鉴权
-// ============================================================
 function getAuthUrl() {
     const date = new Date().toUTCString();
     const signatureOrigin = `host: ${XFYUN_CONFIG.HOST}\ndate: ${date}\nGET ${XFYUN_CONFIG.URI} HTTP/1.1`;
@@ -31,9 +25,6 @@ function getAuthUrl() {
     return `wss://${XFYUN_CONFIG.HOST}${XFYUN_CONFIG.URI}?authorization=${authorization}&date=${encodeURIComponent(date)}&host=${XFYUN_CONFIG.HOST}`;
 }
 
-// ============================================================
-// 路由
-// ============================================================
 app.post('/api/evaluate', async (req, res) => {
     const t0 = Date.now();
     try {
@@ -43,7 +34,6 @@ app.post('/api/evaluate', async (req, res) => {
         }
         const audioBytes = Buffer.from(audio, 'base64').length;
         console.log(`[Tom] 请求 | "${text}" | ${audioBytes}B (${(audioBytes / 32000).toFixed(1)}s)`);
-
         const result = await evaluateAudio(audio, text);
         console.log(`[Tom] 完成 | 得分=${result.score} | ${Date.now() - t0}ms`);
         res.json(result);
@@ -63,12 +53,14 @@ app.listen(PORT, () => {
 });
 
 // ============================================================
-// 讯飞 ISE v2 评测
+// 讯飞 ISE v2 协议（根据实际测试修正）：
 //
-// 协议规则（严格遵守）：
-//   首帧：{ common, business(cmd=ssb), data(status=0) }
-//   中间帧：{ data(status=1) }       ← 不带 common 和 business
-//   尾帧：{ data(status=2) }         ← 不带 common 和 business
+//   首帧：  common + business(完整参数, cmd="ssb") + data(status=0)
+//   中间帧：business(只含 cmd="auw")               + data(status=1)
+//   尾帧：  business(只含 cmd="aue")               + data(status=2)
+//
+// 首帧的 business 包含所有评测参数。
+// 后续帧的 business 只需要 cmd 字段指示当前阶段。
 // ============================================================
 function evaluateAudio(audioBase64, text) {
     return new Promise((resolve, reject) => {
@@ -86,14 +78,13 @@ function evaluateAudio(audioBase64, text) {
 
         const ws = new WebSocket(getAuthUrl());
         const audioBuffer = Buffer.from(audioBase64, 'base64');
-        const FRAME_SIZE = 1280; // 40ms @16kHz/16bit — 讯飞推荐值
+        const FRAME_SIZE = 1280; // 40ms @16kHz/16bit
         const MAX_BUFFERED = 1024 * 1024;
         let offset = 0;
         let frameCount = 0;
 
         console.log(`[Tom] 音频=${audioBuffer.length}B 帧数=${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
 
-        // 30s 超时
         timeoutTimer = setTimeout(() => { done(new Error('超时(30s)')); }, 30000);
 
         ws.on('open', () => {
@@ -115,7 +106,7 @@ function evaluateAudio(audioBase64, text) {
                 let frame;
 
                 if (isFirst) {
-                    // ========== 首帧：common + business + data ==========
+                    // ===== 首帧：完整参数 =====
                     frame = {
                         common: {
                             app_id: XFYUN_CONFIG.APPID
@@ -138,12 +129,27 @@ function evaluateAudio(audioBase64, text) {
                             data: chunk.toString('base64')
                         }
                     };
-                    console.log('[Tom] 发送首帧 (cmd=ssb, status=0)');
-                } else {
-                    // ========== 中间帧/尾帧：只有 data ==========
+                } else if (isLast) {
+                    // ===== 尾帧：business 只含 cmd=aue =====
                     frame = {
+                        business: {
+                            cmd: 'aue'
+                        },
                         data: {
-                            status: isLast ? 2 : 1,
+                            status: 2,
+                            encoding: 'raw',
+                            data_type: 1,
+                            data: chunk.toString('base64')
+                        }
+                    };
+                } else {
+                    // ===== 中间帧：business 只含 cmd=auw =====
+                    frame = {
+                        business: {
+                            cmd: 'auw'
+                        },
+                        data: {
+                            status: 1,
                             encoding: 'raw',
                             data_type: 1,
                             data: chunk.toString('base64')
@@ -155,8 +161,11 @@ function evaluateAudio(audioBase64, text) {
                 offset = end;
                 frameCount++;
 
+                if (isFirst) {
+                    console.log('[Tom] 首帧已发送 (cmd=ssb, status=0)');
+                }
                 if (isLast) {
-                    console.log(`[Tom] 尾帧已发送 (status=2), 共${frameCount}帧, 等待结果...`);
+                    console.log(`[Tom] 尾帧已发送 (cmd=aue, status=2), 共${frameCount}帧`);
                 } else {
                     setTimeout(sendNext, 40);
                 }
@@ -176,7 +185,7 @@ function evaluateAudio(audioBase64, text) {
                     return;
                 }
 
-                console.log(`[Tom] 收到消息: code=${resp.code} status=${resp.data && resp.data.status} sid=${resp.sid || ''}`);
+                console.log(`[Tom] 消息: code=${resp.code} data.status=${resp.data && resp.data.status} sid=${resp.sid || ''}`);
 
                 // 刷新超时
                 if (timeoutTimer) {
