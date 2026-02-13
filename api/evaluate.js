@@ -28,75 +28,65 @@ function getAuthUrl() {
 app.post('/api/evaluate', async (req, res) => {
   try {
     const { audio, text } = req.body;
-    if (!audio || !text) return res.status(400).json({ success: false, error: 'Missing audio or text' });
-    
-    console.log(`[Client] Request received. Word: ${text}, Audio Base64 length: ${audio.length}`);
+    if (!audio || !text) return res.status(400).json({ success: false, error: '缺少数据' });
+    console.log(`[HTTP] 收到请求，单词: ${text}`);
     const result = await evaluateAudio(audio, text);
     return res.status(200).json(result);
   } catch (error) {
-    console.error('[Backend Final Error]', error.message);
+    console.error('[HTTP Error]', error.message);
     return res.status(500).json({ success: false, error: error.message });
   }
 });
 
-app.get('/', (req, res) => res.send('Tom English Backend is Running with Debug Mode.'));
+app.get('/', (req, res) => res.send('ISE Backend is Running!'));
 app.listen(process.env.PORT || 8080);
 
 function evaluateAudio(audioBase64, text) {
   return new Promise((resolve, reject) => {
-    // 1. 验证环境变量
-    if (!XFYUN_CONFIG.APPID || !XFYUN_CONFIG.API_KEY || !XFYUN_CONFIG.API_SECRET) {
-      return reject(new Error('Railway环境变量(APPID/KEY/SECRET)未正确配置'));
-    }
-
     const authUrl = getAuthUrl();
-    console.log('[iFlytek] Connecting to WS...');
     const ws = new WebSocket(authUrl);
     const audioBuffer = Buffer.from(audioBase64, 'base64');
     let finalResult = null;
-    let wsClosed = false;
-
-    const FRAME_SIZE = 5000;
-    let offset = 0;
 
     ws.on('open', () => {
-      console.log('[iFlytek] WS Open. Total bytes:', audioBuffer.length);
+      console.log('[WS] 已连接，正在发送“纯指令”首帧...');
 
-      const sendNext = () => {
-        if (ws.readyState !== WebSocket.OPEN) return;
+      // 第一帧：status: 0，不带音频数据。强制 cmd 排在 business 的最前面。
+      const firstFrame = {
+        common: { app_id: XFYUN_CONFIG.APPID },
+        business: {
+          cmd: 'ssb',
+          sub: 'ise',
+          ent: 'en_vip',
+          category: 'read_word',
+          auf: 'audio/L16;rate=16000',
+          aue: 'raw',
+          tte: 'utf-8',
+          // 讯飞ISE V2 官方要求：Base64 编码的 UTF-8 文本且带 BOM 头
+          text: Buffer.from('\ufeff' + text, 'utf8').toString('base64'),
+          ttp_skip: true,
+          aus: 1
+        },
+        data: {
+          status: 0,
+          data: "" // 首帧数据必须为空，纯握手参数
+        }
+      };
 
-        const isFirst = (offset === 0);
-        const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
-        const chunk = audioBuffer.slice(offset, Math.min(offset + FRAME_SIZE, audioBuffer.length));
-        
-        let frame = {};
+      ws.send(JSON.stringify(firstFrame));
 
-        if (isFirst) {
-          frame = {
-            common: { app_id: XFYUN_CONFIG.APPID },
-            business: {
-              category: 'read_word',
-              sub: 'ise',
-              ent: 'en_vip',
-              cmd: 'ssb', // 讯飞ISE v2 核心指令
-              auf: 'audio/L16;rate=16000',
-              aue: 'raw',
-              tte: 'utf-8',
-              // 按照你的建议：先尝试不加BOM的Base64
-              text: Buffer.from(text).toString('base64'),
-              ttp_skip: true,
-              aus: 1
-            },
-            data: {
-              status: 0,
-              encoding: 'raw',
-              data_type: 1,
-              data: chunk.toString('base64')
-            }
-          };
-          console.log('[iFlytek] Sending FIRST frame. Business CMD:', frame.business.cmd);
-        } else {
-          frame = {
+      // 稍微延迟一下开始发音频数据，确保讯飞先处理完 ssb 指令
+      setTimeout(() => {
+        const FRAME_SIZE = 5000;
+        let offset = 0;
+
+        const timer = setInterval(() => {
+          if (ws.readyState !== WebSocket.OPEN) return clearInterval(timer);
+
+          const isLast = (offset + FRAME_SIZE >= audioBuffer.length);
+          const chunk = audioBuffer.slice(offset, Math.min(offset + FRAME_SIZE, audioBuffer.length));
+
+          const audioFrame = {
             data: {
               status: isLast ? 2 : 1,
               encoding: 'raw',
@@ -104,62 +94,36 @@ function evaluateAudio(audioBase64, text) {
               data: chunk.toString('base64')
             }
           };
-        }
 
-        ws.send(JSON.stringify(frame));
-        offset += FRAME_SIZE;
+          ws.send(JSON.stringify(audioFrame));
+          offset += FRAME_SIZE;
 
-        if (!isLast) {
-          setTimeout(sendNext, 40);
-        } else {
-          console.log('[iFlytek] All audio frames sent.');
-        }
-      };
-
-      sendNext();
+          if (isLast) {
+            console.log('[WS] 音频发送完毕');
+            clearInterval(timer);
+          }
+        }, 40);
+      }, 100); 
     });
 
     ws.on('message', (data) => {
-      try {
-        const resp = JSON.parse(data);
-        
-        // 如果出错，打印讯飞返回的完整 JSON 结构，用于诊断 30002
-        if (resp.code !== 0) {
-          console.error('[iFlytek] API Error Response:', JSON.stringify(resp, null, 2));
-          ws.close();
-          return reject(new Error(`讯飞报错(${resp.code}): ${resp.message}`));
-        }
-
-        if (resp.data && resp.data.status === 2) {
-          finalResult = resp.data;
-          console.log('[iFlytek] Final result received.');
-          const parsed = parseResult(finalResult);
-          wsClosed = true;
-          ws.close();
-          resolve(parsed);
-        }
-      } catch (e) {
-        console.error('[iFlytek] Message parse error:', e.message);
-      }
-    });
-
-    ws.on('error', (err) => {
-      console.error('[iFlytek] WebSocket Error:', err.message);
-      reject(new Error('WS连接失败: ' + err.message));
-    });
-
-    ws.on('close', (code, reason) => {
-      console.log(`[iFlytek] WS Closed. Code: ${code}, Reason: ${reason}`);
-      if (!finalResult) reject(new Error('连接关闭，未获取到评分结果'));
-    });
-
-    // 30秒安全超时
-    setTimeout(() => {
-      if (ws.readyState === WebSocket.OPEN) {
+      const resp = JSON.parse(data);
+      if (resp.code !== 0) {
+        console.error('[WS Error Response]', JSON.stringify(resp));
         ws.close();
-        reject(new Error('评测超时'));
+        return reject(new Error(`讯飞报错(${resp.code}): ${resp.message}`));
       }
-    }, 30000);
+      
+      if (resp.data && resp.data.status === 2) {
+        finalResult = resp.data;
+        ws.close();
+        resolve(parseResult(finalResult));
+      }
+    });
+
+    ws.on('error', (err) => reject(new Error('WS连接错误')));
+    ws.on('close', () => { if (!finalResult) reject(new Error('连接关闭，未收到评分')); });
+    setTimeout(() => { if (ws.readyState === WebSocket.OPEN) ws.close(); }, 30000);
   });
 }
 
@@ -171,10 +135,9 @@ function parseResult(data) {
     return {
       success: true,
       score: Math.round(wordInfo.total_score || 0),
-      accuracy: Math.round(wordInfo.accuracy_score || 0),
-      fluency: Math.round(wordInfo.fluency_score || 0)
+      accuracy: Math.round(wordInfo.accuracy_score || 0)
     };
   } catch (e) {
-    return { success: false, error: '结果解析失败' };
+    return { success: false, error: '解析结果失败' };
   }
 }
