@@ -19,7 +19,7 @@ const XFYUN_CONFIG = {
 };
 
 // ============================================================
-// 讯飞 WebSocket 签名鉴权
+// 签名鉴权
 // ============================================================
 function getAuthUrl() {
     const date = new Date().toUTCString();
@@ -32,25 +32,24 @@ function getAuthUrl() {
 }
 
 // ============================================================
-// API 路由
+// 路由
 // ============================================================
 app.post('/api/evaluate', async (req, res) => {
-    const startTime = Date.now();
+    const t0 = Date.now();
     try {
         const { audio, text } = req.body;
         if (!audio || !text) {
-            return res.status(400).json({ success: false, error: '缺少 audio 或 text 参数' });
+            return res.status(400).json({ success: false, error: '缺少 audio 或 text' });
         }
         const audioBytes = Buffer.from(audio, 'base64').length;
-        console.log(`[Tom] 收到请求 | 单词: "${text}" | 音频: ${audioBytes}B (${(audioBytes / 32000).toFixed(1)}s)`);
+        console.log(`[Tom] 请求 | "${text}" | ${audioBytes}B (${(audioBytes / 32000).toFixed(1)}s)`);
 
         const result = await evaluateAudio(audio, text);
-
-        console.log(`[Tom] 完成 | 得分: ${result.score} | 耗时: ${Date.now() - startTime}ms`);
+        console.log(`[Tom] 完成 | 得分=${result.score} | ${Date.now() - t0}ms`);
         res.json(result);
-    } catch (error) {
-        console.error(`[Tom] 失败 | 耗时: ${Date.now() - startTime}ms |`, error.message);
-        res.status(500).json({ success: false, error: error.message });
+    } catch (err) {
+        console.error(`[Tom] 失败 | ${Date.now() - t0}ms |`, err.message);
+        res.status(500).json({ success: false, error: err.message });
     }
 });
 
@@ -59,21 +58,25 @@ app.get('/health', (req, res) => res.json({ ok: true, ts: Date.now() }));
 
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-    console.log(`[Tom] 服务启动 port=${PORT}`);
-    console.log(`[Tom] APPID: ${XFYUN_CONFIG.APPID ? '✅' : '❌ 未配置'}`);
-    console.log(`[Tom] API_KEY: ${XFYUN_CONFIG.API_KEY ? '✅' : '❌ 未配置'}`);
-    console.log(`[Tom] API_SECRET: ${XFYUN_CONFIG.API_SECRET ? '✅' : '❌ 未配置'}`);
+    console.log(`[Tom] port=${PORT}`);
+    console.log(`[Tom] APPID=${XFYUN_CONFIG.APPID ? '✅' : '❌'} KEY=${XFYUN_CONFIG.API_KEY ? '✅' : '❌'} SECRET=${XFYUN_CONFIG.API_SECRET ? '✅' : '❌'}`);
 });
 
 // ============================================================
-// 讯飞语音评测核心
+// 讯飞 ISE 评测
+//
+// 关键协议（v2 流式版）：
+//   第一帧：common + business(cmd=ssb) + data(status=0)
+//   中间帧：business(cmd=auw) + data(status=1)
+//   最后帧：business(cmd=aue) + data(status=2)
+//
+// 每一帧都必须带 business.cmd，否则报 30002
 // ============================================================
 function evaluateAudio(audioBase64, text) {
     return new Promise((resolve, reject) => {
         let finished = false;
         let timeoutTimer = null;
 
-        // 统一出口：防重复触发 + 清理资源
         const done = (err, result) => {
             if (finished) return;
             finished = true;
@@ -83,31 +86,35 @@ function evaluateAudio(audioBase64, text) {
             else resolve(result);
         };
 
-        // 连接讯飞
         const ws = new WebSocket(getAuthUrl());
         const audioBuffer = Buffer.from(audioBase64, 'base64');
-
-        // 每帧 2560 bytes = 80ms @16kHz/16bit/mono，减少帧数
-        const FRAME_SIZE = 2560;
-        const MAX_BUFFERED = 1024 * 1024; // 1MB 缓冲上限
+        const FRAME_SIZE = 2560; // 80ms @16kHz/16bit
+        const MAX_BUFFERED = 1024 * 1024;
         let offset = 0;
 
-        console.log(`[Tom] 音频: ${audioBuffer.length}B, 帧数: ${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
+        console.log(`[Tom] 音频=${audioBuffer.length}B 帧数=${Math.ceil(audioBuffer.length / FRAME_SIZE)}`);
 
-        // 30 秒总超时
-        timeoutTimer = setTimeout(() => {
-            done(new Error('评测超时(30s)'));
-        }, 30000);
+        // 30s 超时
+        timeoutTimer = setTimeout(() => { done(new Error('超时(30s)')); }, 30000);
 
-        // ---- 发送音频（带流控） ----
+        // 构造 business 参数的基础部分
+        const baseBusiness = {
+            category: 'read_word',
+            sub: 'ise',
+            ent: 'en_vip',
+            auf: 'audio/L16;rate=16000',
+            aue: 'raw',
+            tte: 'utf-8',
+            text: Buffer.from('\uFEFF' + text).toString('base64'),
+            ttp_skip: true
+        };
+
         ws.on('open', () => {
-            console.log('[Tom] WS已连接，发送音频...');
+            console.log('[Tom] WS连接成功');
 
             const sendNext = () => {
                 if (finished) return;
                 if (ws.readyState !== WebSocket.OPEN) return;
-
-                // 流控
                 if (ws.bufferedAmount > MAX_BUFFERED) {
                     setTimeout(sendNext, 10);
                     return;
@@ -118,7 +125,18 @@ function evaluateAudio(audioBase64, text) {
                 const isFirst = (offset === 0);
                 const isLast  = (end >= audioBuffer.length);
 
+                // 每一帧都带 business.cmd
+                let cmd;
+                if (isFirst) {
+                    cmd = 'ssb'; // 开始
+                } else if (isLast) {
+                    cmd = 'aue'; // 结束
+                } else {
+                    cmd = 'auw'; // 中间
+                }
+
                 const frame = {
+                    business: Object.assign({}, baseBusiness, { cmd: cmd }),
                     data: {
                         status: isFirst ? 0 : (isLast ? 2 : 1),
                         encoding: 'raw',
@@ -127,72 +145,67 @@ function evaluateAudio(audioBase64, text) {
                     }
                 };
 
+                // 只有第一帧带 common
                 if (isFirst) {
                     frame.common = { app_id: XFYUN_CONFIG.APPID };
-                    frame.business = {
-                        category: 'read_word',
-                        sub: 'ise',
-                        ent: 'en_vip',
-                        cmd: 'ssb',
-                        auf: 'audio/L16;rate=16000',
-                        aue: 'raw',
-                        tte: 'utf-8',
-                        text: Buffer.from('\uFEFF' + text).toString('base64'),
-                        ttp_skip: true
-                    };
                 }
 
                 ws.send(JSON.stringify(frame));
                 offset = end;
 
+                if (isFirst) {
+                    console.log('[Tom] 首帧已发送 (cmd=ssb)');
+                }
+
                 if (!isLast) {
                     setTimeout(sendNext, 20);
                 } else {
-                    console.log('[Tom] 音频发送完毕，等待结果...');
+                    console.log('[Tom] 尾帧已发送 (cmd=aue)，等待结果...');
                 }
             };
 
             sendNext();
         });
 
-        // ---- 接收结果 ----
         ws.on('message', (rawData) => {
             if (finished) return;
             try {
                 const resp = JSON.parse(rawData);
 
                 if (resp.code !== 0) {
+                    console.error(`[Tom] 讯飞错误: code=${resp.code} msg=${resp.message}`);
                     done(new Error(`讯飞错误(${resp.code}): ${resp.message}`));
                     return;
                 }
 
-                // 收到消息就刷新超时
+                // 刷新超时
                 if (timeoutTimer) {
                     clearTimeout(timeoutTimer);
-                    timeoutTimer = setTimeout(() => {
-                        done(new Error('评测超时(等待结果30s)'));
-                    }, 30000);
+                    timeoutTimer = setTimeout(() => { done(new Error('超时(等结果30s)')); }, 30000);
                 }
 
                 if (resp.data && resp.data.status === 2) {
                     const resultStr = Buffer.from(resp.data.data, 'base64').toString('utf-8');
-                    console.log('[Tom] 原始结果(前300):', resultStr.substring(0, 300));
+                    console.log('[Tom] 结果(前300):', resultStr.substring(0, 300));
 
                     try {
                         const resObj = JSON.parse(resultStr);
                         let score = 0;
-                        const word = resObj.read_word;
-                        if (word?.rec_paper?.read_chapter?.word?.[0]?.total_score != null) {
-                            score = word.rec_paper.read_chapter.word[0].total_score;
-                        } else if (word?.rec_paper?.read_chapter?.total_score != null) {
-                            score = word.rec_paper.read_chapter.total_score;
-                        } else if (word?.rec_paper?.total_score != null) {
-                            score = word.rec_paper.total_score;
+                        const w = resObj.read_word;
+                        if (w && w.rec_paper && w.rec_paper.read_chapter) {
+                            const ch = w.rec_paper.read_chapter;
+                            if (ch.word && ch.word[0] && ch.word[0].total_score != null) {
+                                score = ch.word[0].total_score;
+                            } else if (ch.total_score != null) {
+                                score = ch.total_score;
+                            }
+                        } else if (w && w.rec_paper && w.rec_paper.total_score != null) {
+                            score = w.rec_paper.total_score;
                         }
-                        console.log(`[Tom] 得分: ${score}`);
+                        console.log(`[Tom] 得分=${score}`);
                         done(null, { success: true, score: Math.round(score) });
-                    } catch (parseErr) {
-                        done(new Error('解析评测JSON失败: ' + parseErr.message));
+                    } catch (pe) {
+                        done(new Error('解析结果JSON失败: ' + pe.message));
                     }
                 }
             } catch (e) {
@@ -202,12 +215,12 @@ function evaluateAudio(audioBase64, text) {
 
         ws.on('error', (err) => {
             console.error('[Tom] WS Error:', err.message);
-            done(new Error('WebSocket错误: ' + err.message));
+            done(new Error('WS错误: ' + err.message));
         });
 
         ws.on('close', (code, reason) => {
-            console.log(`[Tom] WS关闭 code=${code} reason=${reason || ''}`);
-            done(new Error(`WebSocket关闭(code=${code})`));
+            console.log(`[Tom] WS关闭 code=${code}`);
+            done(new Error('WS关闭(' + code + ')'));
         });
     });
 }
