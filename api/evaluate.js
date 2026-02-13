@@ -17,7 +17,8 @@ const XFYUN_CONFIG = {
 
 function getAuthUrl() {
   const date = new Date().toUTCString();
-  const signatureOrigin = `host: ${XFYUN_CONFIG.HOST}\r\ndate: ${date}\r\nGET ${XFYUN_CONFIG.URI} HTTP/1.1`;
+  // 签名原串：严格遵守讯飞握手协议
+  const signatureOrigin = `host: ${XFYUN_CONFIG.HOST}\ndate: ${date}\nGET ${XFYUN_CONFIG.URI} HTTP/1.1`;
   const hmac = crypto.createHmac('sha256', XFYUN_CONFIG.API_SECRET);
   const signature = hmac.update(signatureOrigin).digest('base64');
   const authorizationOrigin = `api_key="${XFYUN_CONFIG.API_KEY}", algorithm="hmac-sha256", headers="host date request-line", signature="${signature}"`;
@@ -28,10 +29,8 @@ function getAuthUrl() {
 app.post('/api/evaluate', async (req, res) => {
   try {
     const { audio, text } = req.body;
-    // 1. 空音频保护 (建议项 1)
-    if (!audio || audio.length === 0) return res.status(400).json({ success: false, error: '音频数据为空' });
-    
-    console.log(`[TomEnglish] 评测请求: ${text}, 数据大小: ${audio.length}`);
+    if (!audio || !text) return res.status(400).json({ success: false, error: '缺少数据' });
+    console.log(`[TomEnglish] 收到请求: ${text}, 长度: ${audio.length}`);
     const result = await evaluateAudio(audio, text);
     return res.status(200).json(result);
   } catch (error) {
@@ -40,7 +39,7 @@ app.post('/api/evaluate', async (req, res) => {
   }
 });
 
-app.get('/', (req, res) => res.send('Backend v1.1.0 Gold Stable'));
+app.get('/', (req, res) => res.send('Backend is Debugging...'));
 app.listen(process.env.PORT || 8080);
 
 function evaluateAudio(audioBase64, text) {
@@ -50,28 +49,24 @@ function evaluateAudio(audioBase64, text) {
     const ws = new WebSocket(authUrl);
     const audioBuffer = Buffer.from(audioBase64, 'base64');
     
-    const FRAME_SIZE = 1280; 
     let offset = 0;
+    const FRAME_SIZE = 1280;
     let finalResult = null;
 
-    // 3. WS 心跳检测 (建议项 3)
-    let lastMessageTime = Date.now();
-    const heartbeat = setInterval(() => {
-      if (Date.now() - lastMessageTime > 15000) {
-        console.warn('[iFlytek] 连接非正常静默，主动断开');
+    // 定时器检查
+    const timeoutTimer = setTimeout(() => {
+      if (!resolvedOrRejected) {
+        resolvedOrRejected = true;
         ws.terminate();
+        reject(new Error('讯飞连接超时'));
       }
-    }, 5000);
-
-    const cleanup = () => {
-      clearInterval(heartbeat);
-      resolvedOrRejected = true;
-    };
+    }, 15000);
 
     ws.on('open', () => {
-      const sendNextFrame = () => {
+      console.log('[iFlytek] WS 连接已建立，开始传输...');
+      
+      const sendNext = () => {
         if (ws.readyState !== WebSocket.OPEN) return;
-
         const isFirst = (offset === 0);
         const chunk = audioBuffer.slice(offset, Math.min(offset + FRAME_SIZE, audioBuffer.length));
         const isLast = (offset + chunk.length >= audioBuffer.length);
@@ -95,49 +90,52 @@ function evaluateAudio(audioBase64, text) {
             auf: 'audio/L16;rate=16000',
             aue: 'raw',
             tte: 'utf-8',
-            text: Buffer.from(text).toString('base64')
+            text: Buffer.from('\uFEFF' + text).toString('base64'),
+            ttp_skip: true
           };
         }
 
         ws.send(JSON.stringify(frame));
         offset += chunk.length;
-
-        if (!isLast) {
-          setTimeout(sendNextFrame, 40);
-        }
+        if (!isLast) setTimeout(sendNext, 40);
       };
-      sendNextFrame();
+      sendNext();
     });
 
     ws.on('message', (data) => {
-      lastMessageTime = Date.now();
       const resp = JSON.parse(data);
       if (resp.code !== 0) {
-        cleanup();
-        ws.close();
-        if (!resolvedOrRejected) reject(new Error(`讯飞报错(${resp.code}): ${resp.message}`));
-        return;
-      }
-
-      if (resp.data && resp.data.status === 2) {
+        console.error('[iFlytek Error Response]', JSON.stringify(resp));
+        if (!resolvedOrRejected) {
+          resolvedOrRejected = true;
+          ws.close();
+          reject(new Error(`讯飞报错(${resp.code}): ${resp.message}`));
+        }
+      } else if (resp.data && resp.data.status === 2) {
         finalResult = resp.data;
-        cleanup();
-        ws.close();
-        resolve(parseResult(finalResult));
+        if (!resolvedOrRejected) {
+          resolvedOrRejected = true;
+          clearTimeout(timeoutTimer);
+          ws.close();
+          resolve(parseResult(finalResult));
+        }
       }
     });
 
     ws.on('error', (err) => {
+      console.error('[iFlytek WS Error Detail]', err); // 这里的详细日志非常重要！
       if (!resolvedOrRejected) {
-        cleanup();
-        reject(new Error('WebSocket异常'));
+        resolvedOrRejected = true;
+        clearTimeout(timeoutTimer);
+        reject(new Error(`WebSocket异常: ${err.message}`));
       }
     });
 
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
       if (!resolvedOrRejected) {
-        cleanup();
-        reject(new Error('连接已关闭'));
+        resolvedOrRejected = true;
+        clearTimeout(timeoutTimer);
+        reject(new Error(`连接已关闭(Code:${code}, Reason:${reason})`));
       }
     });
   });
@@ -147,20 +145,9 @@ function parseResult(data) {
   try {
     const resStr = Buffer.from(data.data, 'base64').toString('utf-8');
     const resObj = JSON.parse(resStr);
-    
-    // 2. 多重结构兼容解析 (建议项 2)
-    const wordBase = resObj.read_word?.rec_paper?.read_chapter || 
-                     resObj.read_sentence?.rec_paper?.read_chapter || {};
-    
-    const word = wordBase.word?.[0] || 
-                 wordBase.sentence?.[0]?.word?.[0] || {};
-    
-    return {
-      success: true,
-      score: Math.round(word.total_score || wordBase.total_score || 0),
-      accuracy: Math.round(word.accuracy_score || 0)
-    };
+    const word = resObj.read_word?.rec_paper?.read_chapter?.word?.[0] || {};
+    return { success: true, score: Math.round(word.total_score || 0) };
   } catch (e) {
-    return { success: false, error: '解析结果异常' };
+    return { success: false, error: '解析结果失败' };
   }
 }
